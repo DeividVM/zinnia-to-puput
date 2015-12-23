@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 import os
 import lxml.html
+from xml.etree import ElementTree as ET
+
+try:
+    from urllib.request import urlopen
+except ImportError:  # Python 2
+    from urllib2 import urlopen
 
 from django.core.management import BaseCommand
 from django.conf import settings
 from django.core.files import File
 from wagtail.wagtailcore.models import Page, Site
 from wagtail.wagtailimages.models import Image as WagtailImage
+from django.core.files.temp import NamedTemporaryFile
 from zinnia.models import Category as ZinniaCategory, Entry as ZinniaEntry
-
 
 from puput.models import BlogPage, EntryPage, TagEntryPage as PuputTagEntryPage, Tag as PuputTag, \
     Category as PuputCategory, CategoryEntryPage as PuputCategoryEntryPage, EntryPageRelated
@@ -62,6 +68,15 @@ class Command(BaseCommand):
             )
             puput_category.save()
 
+    def _import_image(self, image_url):
+        img = NamedTemporaryFile(delete=True)
+        img.write(urlopen(image_url).read())
+        img.flush()
+        return img
+
+    def _image_to_embed(self, image):
+        return '<embed alt="{}" embedtype="image" format="fullwidth" id="{}"/>'.format(image.title, image.id)
+
     def import_entries(self):
         self.stdout.write("Importing entries...")
         entries = ZinniaEntry.objects.all()
@@ -78,15 +93,19 @@ class Command(BaseCommand):
             self.stdout.write('\tGenerate and replace entry content images....')
             if entry.content:
                 root = lxml.html.fromstring(entry.content)
-                for el in root.iter('img'):
-                    if el.attrib['src'].startswith(settings.MEDIA_URL):
-                        old_image = el.attrib['src'].replace(settings.MEDIA_URL, '')
-                        with open('{}/{}'.format(settings.MEDIA_ROOT, old_image), 'r') as image_file:
-                            new_image = WagtailImage(file=File(file=image_file, name=os.path.basename(old_image)),
-                                                     title=os.path.basename(old_image))
-                            new_image.save()
-                            el.attrib['src'] = new_image.file.url
-                            self.stdout.write('\t\t{}'.format(new_image.file.url))
+                for img_node in root.iter('img'):
+                    parent_node = img_node.getparent()
+                    if img_node.attrib['src'].startswith(settings.MEDIA_URL):
+                        img = self._import_image(img_node.attrib['src'])
+                        title = img_node.attrib.get('title') or img_node.attrib.get('alt')
+                        new_image = WagtailImage(file=File(file=img, name=title), title=title)
+                        new_image.save()
+                        if parent_node.tag == 'a':
+                            parent_node.addnext(ET.XML(self._image_to_embed(new_image)))
+                            parent_node.drop_tree()
+                        else:
+                            parent_node.append(ET.XML(self._image_to_embed(new_image)))
+                            img_node.drop_tag()
 
                 # New content with images replaced
                 content = lxml.html.tostring(root, pretty_print=True)
